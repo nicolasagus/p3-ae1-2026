@@ -1,0 +1,216 @@
+import { createHash } from 'node:crypto';
+import {
+  concurrencyConflict,
+  idempotencyConflict,
+  invalidTransition,
+  ticketNotFound,
+  tripNotFound,
+  validationError,
+} from '../errors/support-error.js';
+import type { SupportEventPublisher } from '../events/support-event-publisher.js';
+import type { TripVerifier } from '../integrations/m6-trips.js';
+import { TRANSICIONES_PERMITIDAS } from '../models/ticket.model.js';
+import type { Ticket, TicketHistoryEntry, TicketStatus } from '../models/ticket.model.js';
+import { IdempotencyKeyConflictError, TicketVersionConflictError } from '../repositories/ticket.repository.js';
+import type {
+  CambioDeEstado,
+  OpcionesDeCreacion,
+  OrdenDeTickets,
+  PosicionDeListado,
+  TicketRepository,
+} from '../repositories/ticket.repository.js';
+
+export interface OpcionesDeNuevoTicket extends OpcionesDeCreacion {
+  // Si se indica, repetir el pedido con la misma clave no crea otro ticket.
+  idempotencyKey?: string;
+}
+
+export interface ConsultaDeTickets {
+  tripId?: string;
+  autor?: string;
+  estado?: TicketStatus;
+  orden?: OrdenDeTickets;
+  limit?: number;
+  cursor?: string;
+}
+
+const LIMITE_POR_DEFECTO = 50;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// El cursor es opaco para el cliente: codifica la posición del último ticket
+// de la página.
+function codificarCursor({ fechaCreacion, id }: PosicionDeListado, orden: OrdenDeTickets): string {
+  return Buffer.from(JSON.stringify([fechaCreacion, id, orden])).toString('base64url');
+}
+
+function decodificarCursor(cursor: string, orden: OrdenDeTickets): PosicionDeListado {
+  try {
+    const [fechaCreacion, id, ordenDelCursor = 'desc'] = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    if (ordenDelCursor === orden && typeof fechaCreacion === 'string' && typeof id === 'string' && UUID.test(id) && !Number.isNaN(Date.parse(fechaCreacion))) {
+      return { fechaCreacion, id };
+    }
+  } catch {
+    // Se informa abajo como cursor inválido.
+  }
+  throw validationError([{ field: 'cursor', reason: 'No es un cursor válido.' }]);
+}
+
+// Huella del pedido ya normalizado, con las claves ordenadas: no depende de si
+// el cliente envió tripId o viajeId ni del orden de los campos.
+function huellaDelPedido(pedido: Record<string, string>): string {
+  const ordenado = Object.keys(pedido)
+    .sort()
+    .map((clave) => [clave, pedido[clave]]);
+  return createHash('sha256').update(JSON.stringify(ordenado)).digest('hex');
+}
+
+// Casos de uso de tickets (RF-8.5). No conoce Express, el motor de
+// persistencia ni el broker: recibe sus dependencias por constructor.
+export class TicketService {
+  constructor(
+    private readonly repository: TicketRepository,
+    private readonly eventPublisher: SupportEventPublisher,
+    // Sin verificador no se consulta a M6: cualquier tripId se acepta.
+    private readonly tripVerifier?: TripVerifier,
+  ) {}
+
+  async crearTicket(
+    tripId: string,
+    motivo: string,
+    { idempotencyKey, ...opciones }: OpcionesDeNuevoTicket = {},
+  ): Promise<{ ticket: Ticket; creado: boolean }> {
+    const resultado = idempotencyKey === undefined
+      ? { ticket: await this.crearVerificado(tripId, motivo, opciones), creado: true }
+      : await this.crearUnaSolaVez(tripId, motivo, idempotencyKey, opciones);
+
+    // Un reintento devuelve el ticket existente sin volver a publicar.
+    if (resultado.creado) {
+      await this.eventPublisher.publish('ticket.creado', resultado.ticket);
+    }
+    return resultado;
+  }
+
+  private async crearVerificado(tripId: string, motivo: string, opciones: OpcionesDeCreacion): Promise<Ticket> {
+    await this.verificarViaje(tripId);
+    return this.repository.crear(tripId, motivo, opciones);
+  }
+
+  // El viaje se verifica sólo si el ticket todavía no existe: un reintento
+  // con una clave ya usada devuelve su ticket sin consultar a M6, también si
+  // M6 está caído. La búsqueda previa es un atajo; quién crea lo sigue
+  // decidiendo crearConClave, de forma atómica.
+  private async crearUnaSolaVez(tripId: string, motivo: string, clave: string, opciones: OpcionesDeCreacion) {
+    try {
+      const hash = huellaDelPedido({ tripId, motivo });
+      if (this.tripVerifier) {
+        const existente = await this.repository.buscarPorClave({ clave, hash });
+        if (existente) {
+          return { ticket: existente, creado: false };
+        }
+        await this.verificarViaje(tripId);
+      }
+      return await this.repository.crearConClave(tripId, motivo, { clave, hash }, opciones);
+    } catch (error) {
+      if (error instanceof IdempotencyKeyConflictError) {
+        throw idempotencyConflict();
+      }
+      throw error;
+    }
+  }
+
+  private async verificarViaje(tripId: string): Promise<void> {
+    if (this.tripVerifier && !(await this.tripVerifier.existe(tripId))) {
+      throw tripNotFound();
+    }
+  }
+
+  async obtenerTicket(id: string): Promise<Ticket> {
+    const ticket = await this.repository.obtenerPorId(id);
+    if (!ticket) {
+      throw ticketNotFound();
+    }
+    return ticket;
+  }
+
+  async actualizarEstado(id: string, nuevoEstado: TicketStatus, cambio: CambioDeEstado = {}, registrarRespuesta = false): Promise<Ticket> {
+    const ticket = await this.obtenerTicket(id);
+
+    // El cliente decidió sobre una versión que ya no es la actual.
+    if (cambio.expectedVersion !== undefined && cambio.expectedVersion !== ticket.version) {
+      throw concurrencyConflict();
+    }
+
+    // Mismo estado: operación sin efecto. No deja historial, no sube la
+    // versión ni publica evento, así un cliente puede reintentar el pedido
+    // sin duplicar nada.
+    if (ticket.estado === nuevoEstado && !registrarRespuesta) {
+      return ticket;
+    }
+
+    if (ticket.estado !== nuevoEstado && !TRANSICIONES_PERMITIDAS[ticket.estado].includes(nuevoEstado)) {
+      throw invalidTransition(ticket.estado, nuevoEstado);
+    }
+    if (ticket.estado === 'RESUELTO' && nuevoEstado === 'ABIERTO' && !cambio.motivo) {
+      throw validationError([{ field: 'motivo', reason: 'Reabrir un ticket resuelto requiere un motivo.' }]);
+    }
+
+    // El cambio se condiciona siempre a la versión recién leída, también para
+    // los clientes que no envían expectedVersion: dos cambios simultáneos no
+    // pueden aplicarse ambos.
+    const ticketActualizado = await this.cambiarEstadoSiSigueEn(ticket, nuevoEstado, cambio);
+    if (!ticketActualizado) {
+      throw ticketNotFound();
+    }
+    await this.eventPublisher.publish('ticket.actualizado', ticketActualizado);
+    return ticketActualizado;
+  }
+
+  async enviarMensaje(id: string, texto: string, actor: string, expectedVersion: number): Promise<Ticket> {
+    const ticket = await this.obtenerTicket(id);
+    if (ticket.version !== expectedVersion) throw concurrencyConflict();
+    const actualizado = await this.cambiarEstadoSiSigueEn(ticket, ticket.estado, { actor, motivo: texto });
+    if (!actualizado) throw ticketNotFound();
+    return actualizado;
+  }
+
+  private async cambiarEstadoSiSigueEn(ticket: Ticket, nuevoEstado: TicketStatus, cambio: CambioDeEstado) {
+    try {
+      return await this.repository.actualizarEstado(ticket.id, nuevoEstado, {
+        ...cambio,
+        expectedVersion: ticket.version,
+      });
+    } catch (error) {
+      if (error instanceof TicketVersionConflictError) {
+        throw concurrencyConflict();
+      }
+      throw error;
+    }
+  }
+
+  async obtenerHistorial(id: string): Promise<TicketHistoryEntry[]> {
+    await this.obtenerTicket(id);
+    return this.repository.listarHistorial(id);
+  }
+
+  async listarTickets(consulta: ConsultaDeTickets = {}): Promise<{ tickets: Ticket[]; siguienteCursor?: string }> {
+    const limit = consulta.limit ?? LIMITE_POR_DEFECTO;
+    const orden = consulta.orden ?? 'desc';
+    const despuesDe = consulta.cursor === undefined ? undefined : decodificarCursor(consulta.cursor, orden);
+
+    // Se pide uno de más para saber si hay otra página.
+    const encontrados = await this.repository.listar({
+      tripId: consulta.tripId,
+      autor: consulta.autor,
+      estado: consulta.estado,
+      orden,
+      limit: limit + 1,
+      despuesDe,
+    });
+    if (encontrados.length <= limit) {
+      return { tickets: encontrados };
+    }
+
+    const tickets = encontrados.slice(0, limit);
+    return { tickets, siguienteCursor: codificarCursor(tickets[tickets.length - 1], orden) };
+  }
+}
